@@ -77,88 +77,82 @@ def get_inspector_status(inspector_client, account_id, scan_components):
     return inspector_status
     
 def get_all_accounts():
-    """
-    Gets a list of Active AWS Accounts in the Organization.
-    This is called if the function is not executed by an Sns trigger
-    and is used for periodic scheduling to ensure all accounts are
-    correctly configured, and prevent gaps in security from activities
-    like new regions being added or GuardDuty being disabled.
-    """
-    aws_account_dict = dict()
-    orgclient = session.client('organizations', region_name=session.region_name)
-    accounts = orgclient.list_accounts()
-    while 'NextToken' in accounts:
-        moreaccounts = orgclient.list_accounts(NextToken=accounts['NextToken'])
-        for acct in accounts['Accounts']:
-            moreaccounts['Accounts'].append(acct)
-        accounts = moreaccounts
-    logger.debug(accounts)
-    for account in accounts['Accounts']:
-        logger.debug(account)
-        # Filter out suspended accounts and save valid accounts in a dict
+    all_accounts=[]
+    active_accounts=[]
+    token_tracker={}
+    while True:
+        member_accounts=org_client.list_accounts(
+            **token_tracker
+        )
+        all_accounts.extend(member_accounts['Accounts'])
+        if 'NextToken' in member_accounts:
+            token_tracker['NextToken'] = member_accounts['NextToken']
+        else:
+            break
+    for account in all_accounts:
         if account['Status'] == 'ACTIVE':
-            accountid = account['Id']
-            email = account['Email']
-            aws_account_dict.update({accountid: email})
-    return aws_account_dict
-
-def enable_inspector2(inspector_client, account_id, region, scan_components):
-    logger.info(f"enable_inspector2: scan_components - ({scan_components})")
-    for attempt_iteration in range(1, ENABLE_RETRY_ATTEMPTS):
-        if get_inspector_status(inspector_client, account_id, scan_components) != "enabled":
-            logger.info(f"Attempt {attempt_iteration} - enabling inspector in the ({account_id}) account in {region}...")
+            active_accounts.append(account)
+    return active_accounts
+    
+def enable_inspector_master():
+    inspector_delegated_admin=org_client.list_delegated_administrators(
+        ServicePrincipal='inspector2.amazonaws.com'
+    )
+    if inspector_delegated_admin['DelegatedAdministrators']:
+        print(f"Delegated Administration has already been configured for Inspector to Account ID: {inspector_delegated_admin['DelegatedAdministrators'][0]['Id']}.")
+    else:
+        try:
+            org_client.register_delegated_administrator(
+                AccountId=account_id,
+                ServicePrincipal='inspector2.amazonaws.com'
+            )
+            print(f"Admin Account delegated in {inspector_delegated_admin}")
+        except ClientError as error:
+            print(f"Unable Delegate Administration for Security Lake. Error: {error}.")
+            
+def enable_inspector_member(accounts, region):
+    details=[]
+    scan_components = ["EC2"] 
+    for account in accounts:
+        if account['Id'] != account_id:
+            member_session=assume_role(account['Id'], role_to_assume)
+            member_client=member_session.client('inspector2', region_name=region)
+            details.append(
+                {
+                    'accountId': account['Id'],
+                    'email': account['Email']
+                }
+            )
             try:
-                enable_inspector_response: Any = inspector_client.enable(
+                response=member_client.enable(
                     accountIds=[
-                        account_id,
+                        account['Id'],
                     ],
                     resourceTypes=scan_components,
                 )
-                api_call_details = {"API_Call": "inspector:Enable", "API_Response": enable_inspector_response}
-                logger.info(api_call_details)
-                print(f"done in {accounts}")
-            except inspector_client.exceptions.ConflictException:
-                logger.info(f"inspector already enabled in {account_id} {region}")
-        else:
-            logger.info(f"Inspector is enabled in the {account_id} account in {region}")
-            break
-        sleep(ENABLE_RETRY_SLEEP_INTERVAL)
+                print(f"Amazon Inspector has been enabled in Account ID: {account['Id']} in {region}.")
+            except ClientError as error:
+                print(f"Amazon Inspector has already been enabled in Account ID: {account['Id']} in {region}.")
 
 def lambda_handler(event, context):
     inspector_regions = boto3.Session().get_available_regions('inspector2')
     control_tower_regions = get_control_tower_regions()
     scan_components = ["EC2"] 
+    inspector_master_account_session=assume_role(account_id, role_to_assume)
     accounts=get_all_accounts()
     if 'RequestType' in event:    
         if (event['RequestType'] == 'Create' or event['RequestType'] == 'Update'):
             try:
-                inspector_delegated_admin=org_client.list_delegated_administrators(
+                org_client.enable_aws_service_access(
                     ServicePrincipal='inspector2.amazonaws.com'
-                )
-                if inspector_delegated_admin['DelegatedAdministrators']:
-                            print(f"Delegated Administration has already been configured for Inspector to Account ID: {inspector_delegated_admin['DelegatedAdministrators'][0]['Id']}.")
-                else:
-                    try:
-                        org_client.register_delegated_administrator(
-                            AccountId=account_id,
-                            ServicePrincipal='inspector2.amazonaws.com'
-                        )
-                    except ClientError as error:
-                            print(f"Delegated Administration for Inspector is already configured. Error: {error}.")
-                    print(f"Admin Account delegated in {inspector_delegated_admin}")
-                for account in accounts:
-                        session = assume_role(account, role_to_assume)    
-                        for region in control_tower_regions:
-                            if region in inspector_regions:
-                                if account not in excluded_accounts:
-                                  inspector_client = session.client('inspector2', region_name=region)
-                                  get_inspector_status(inspector_client, account, scan_components)  
-                                  print(f"Inspector is enabled in Account {account}")
-                                  enable_inspector2(inspector_client, account, region, scan_components)
-                                else:
-                                    print(f'Account excluded: {account}')
-                            else:
-                                print(f"Unable to delegate Admin account")
+                ) 
+                for region in control_tower_regions:
+                    if region in inspector_regions:
+                            enable_inspector_master()
+                            print(f"Admin Account delegated in {account_id}")
+                            enable_inspector_member(accounts, region)
+                            print(f"AWS Inspector Enabled")
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
             except ClientError as error:
                 print(error)
                 cfnresponse.send(event, context, cfnresponse.FAILED, error)
@@ -200,10 +194,11 @@ def lambda_handler(event, context):
                 )
                 for region in control_tower_regions:
                     if region in inspector_regions:
+                        enable_inspector_master()
                         enable_inspector2(inspector_client, account, region, scan_components)
             except ClientError as error:
                 print(f"AWS Service Access has already been configured for Amazon Inspector.")
-            print("done")
+
 
 
 
