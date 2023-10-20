@@ -168,21 +168,30 @@ def lambda_handler(event, context):
                     except ClientError as error:
                         print(f"Delegated Administration for Amazon Macie has been disabled in {region}.")
                     for account in accounts:
-                        if account not in excluded_accounts:
-                            member_session=assume_role(account, role_to_assume)
-                            member_client=member_session.client('inspector2', region_name=region)
-                            inspector_admin_client=inspector_client.client('inspector2', region_name=region)
+                        if account['Id'] != inspector_master_account and account['Id'] not in excluded_accounts:
+                            member_session=assume_role(account['Id'], role_to_assume)
+                            member_client=member_session.client('detective', region_name=region)
+                            details.append(
+                                {
+                                    'accountId': account['Id'],
+                                    'email': account['Email']
+                                }
+                            )
                             try:
-                                inspector_admin_client.delete_member(
-                                    id=account['Id']
+                                graph_arn = member_client.create_graph()['GraphArn']
+                                response=member_client.create_members(
+                                    GraphArn=graph_arn,
+                                    Message='Automatically generated invitation',
+                                    Accounts=[
+                                        {
+                                            'AccountId': account['Id'],
+                                            'EmailAddress': account['Email']
+                                        },
+                                    ]
                                 )
-                            except ClientError as error:
-                                print(f"Unable to delete {account} in {region} as a member from Amazon Inspector as it's not enabled.")    
-                    try:
-                        member_client.disable_inspector()
-                        print(f"Amazon inspector has been disabled in {region}.")
-                    except ClientError as error:
-                        print(f"Unable to disable Amazon inspector in {account} in {region} as it's not enabled.")
+                print(f"Amazon inspector has been enabled in Account ID: {account['Id']} in {region}.")
+            except ClientError as error:
+                print(f"Amazon inspector has already been enabled in Account ID: {account['Id']} in {region}.")
                 cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
             except ClientError as error:
                 print(error)
