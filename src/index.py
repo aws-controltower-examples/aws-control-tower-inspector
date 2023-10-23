@@ -94,7 +94,11 @@ def get_all_accounts():
             active_accounts.append(account)
     return active_accounts
     
-def enable_inspector_master():
+def enable_inspector_master(region):
+    accounts=get_all_accounts()
+    inspector_master_account_session=assume_role(account_id, role_to_assume)
+    inspector_client=boto3.client('inspector2', region_name=region)
+    inspector_admin_client=inspector_master_account_session.client('inspector2', region_name=region)
     inspector_delegated_admin=org_client.list_delegated_administrators(
         ServicePrincipal='inspector2.amazonaws.com'
     )
@@ -102,6 +106,9 @@ def enable_inspector_master():
         print(f"Delegated Administration has already been configured for Inspector to Account ID: {inspector_delegated_admin['DelegatedAdministrators'][0]['Id']}.")
     else:
         try:
+            # inspector_delegated_admin.enable_delegated_admin_account(
+            #     delegatedAdminAccountId=account_id
+            #     )
             org_client.register_delegated_administrator(
                 AccountId=account_id,
                 ServicePrincipal='inspector2.amazonaws.com'
@@ -109,12 +116,21 @@ def enable_inspector_master():
             print(f"Admin Account delegated in {inspector_delegated_admin}")
         except ClientError as error:
             print(f"Unable Delegate Administration for Security Lake. Error: {error}.")
+    try:
+        inspector_admin_client.update_organization_configuration(
+            autoEnable={
+                'ec2': True,
+                'ecr': False
+            }
+        )
+    except ClientError as error:
+        print(f"Unable to update the Organization Configuration for Amazon Inspector in {region}.")
             
 def enable_inspector_member(accounts, region):
     details=[]
     scan_components = ["EC2"] 
     for account in accounts:
-        if account['Id'] != account_id:
+        if account['Id'] not in excluded_accounts:
             member_session=assume_role(account['Id'], role_to_assume)
             member_client=member_session.client('inspector2', region_name=region)
             details.append(
@@ -134,8 +150,10 @@ def enable_inspector_member(accounts, region):
             except ClientError as error:
                 print(f"Amazon Inspector has already been enabled in Account ID: {account['Id']} in {region}.")
 
+
 def lambda_handler(event, context):
     inspector_regions = boto3.Session().get_available_regions('inspector2')
+    details=[]
     control_tower_regions = get_control_tower_regions()
     scan_components = ["EC2"] 
     inspector_master_account_session=assume_role(account_id, role_to_assume)
@@ -148,7 +166,7 @@ def lambda_handler(event, context):
                 ) 
                 for region in control_tower_regions:
                     if region in inspector_regions:
-                            enable_inspector_master()
+                            enable_inspector_master(region)
                             print(f"Admin Account delegated in {account_id}")
                             enable_inspector_member(accounts, region)
                             print(f"AWS Inspector Enabled")
@@ -158,40 +176,30 @@ def lambda_handler(event, context):
                 cfnresponse.send(event, context, cfnresponse.FAILED, error)
         elif (event['RequestType'] == 'Delete'):
             try:
-                session = assume_role(account, role_to_assume)
+                #session = assume_role(account, role_to_assume)
                 for region in control_tower_regions:
                     inspector_client = session.client('inspector2', region_name=region)
                     try:
-                        inspector_client.disable_organization_admin_account(
-                        adminAccountId=inspector_client
-                        )
+                        org_client.deregister_delegated_administrator(
+                            AccountId=account_id,
+                            ServicePrincipal='inspector2.amazonaws.com'
+                        )   
                     except ClientError as error:
-                        print(f"Delegated Administration for Amazon Macie has been disabled in {region}.")
+                        print(f"Delegated Administration for Amazon Inspector has been disabled in {region}.")
                     for account in accounts:
-                        if account['Id'] != inspector_master_account and account['Id'] not in excluded_accounts:
+                        #if account not in excluded_accounts:
                             member_session=assume_role(account['Id'], role_to_assume)
-                            member_client=member_session.client('detective', region_name=region)
-                            details.append(
-                                {
-                                    'accountId': account['Id'],
-                                    'email': account['Email']
-                                }
-                            )
+                            member_client=member_session.client('inspector2', region_name=region)
+                            inspector_admin_client=inspector_master_account_session.client('inspector2', region_name=region)
                             try:
-                                graph_arn = member_client.create_graph()['GraphArn']
-                                response=member_client.create_members(
-                                    GraphArn=graph_arn,
-                                    Message='Automatically generated invitation',
-                                    Accounts=[
-                                        {
-                                            'AccountId': account['Id'],
-                                            'EmailAddress': account['Email']
-                                        },
-                                    ]
+                                inspector_admin_client.disable(
+                                    accountIds=[
+                                        account['Id'],
+                                        ],
+                                    resourceTypes=scan_components,
                                 )
-                print(f"Amazon inspector has been enabled in Account ID: {account['Id']} in {region}.")
-            except ClientError as error:
-                print(f"Amazon inspector has already been enabled in Account ID: {account['Id']} in {region}.")
+                            except ClientError as error:
+                                print(f"Unable to delete {account} in {region} as a member from Amazon Inspector as it's not enabled.")
                 cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
             except ClientError as error:
                 print(error)
@@ -203,11 +211,10 @@ def lambda_handler(event, context):
                 )
                 for region in control_tower_regions:
                     if region in inspector_regions:
-                        enable_inspector_master()
-                        enable_inspector2(inspector_client, account, region, scan_components)
+                        enable_inspector_master(region)
+                        enable_inspector_member(accounts, region)
             except ClientError as error:
                 print(f"AWS Service Access has already been configured for Amazon Inspector.")
-
 
 
 
