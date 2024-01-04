@@ -1,0 +1,13 @@
+---
+name: cf-lint & cf-sec
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  cloudformation-checks:
+    uses: clouddrove/github-shared-workflows/.github/workflows/cf-lint.yml@master
+    with:
+      cf_file_path: ./inspector.template
+...

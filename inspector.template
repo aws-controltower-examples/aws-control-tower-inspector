@@ -1,0 +1,196 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Creates a Lambda function to delegate Amazon Inspector to a audit account in an AWS Organization.  A custom resource is created to immediately invoke the lambda function upon successful deployment.
+Parameters:
+  OrganizationId:
+    Type: String
+    Description: "The Amazon Organizations ID for Control Tower."
+    MinLength: 12
+    MaxLength: 12
+    AllowedPattern: '^[o][\-][a-z0-9]{10}$'
+    ConstraintDescription: "The Organization ID must be a 12 character string starting with o- and followed by 10 Lowercase Alphanumeric Characters."
+  InspectorAuditAccountId:
+    Type: String
+    Description: "The AWS Account ID that will be configured as the Delegated Admin."
+    AllowedPattern: '^[0-9]{12}$'
+    ConstraintDescription: "This must be a 12 character string."
+    MinLength: 12
+    MaxLength: 12
+  S3SourceBucket:
+    Type: String
+    Description: "The S3 Bucket that contains the Lambda Zip File."
+  S3Key:
+    Type: String
+    Description: "The S3 Path to the Lambda Zip File"
+  cfnresponse:
+    Type: String
+    Description: "The cfnrespons Zip File Path Add Here"
+  RoleToAssume:
+    Type: String
+    Default: 'AWSControlTowerExecution'
+    Description: "What role should be assumed in accounts to enable GuardDuty?  The Default is AWSControlTowerExecution for a Control Tower environment."
+  ExcludedAccounts:
+    Description: Excluded Accounts list. This list should contain Management account, Log Archive and Audit accounts at the minimum
+    Default: ""
+    MaxLength: 2000
+    Type: String
+
+Resources:
+  LambdaEnableInspector:
+    Type: AWS::Lambda::Function
+    Properties:
+      Architectures:
+        - x86_64
+      Code:
+        S3Bucket: !Ref S3SourceBucket
+        S3Key: !Ref S3Key
+      Description: "Lambda Function that is triggered by CloudFormation Custom Resource to Enable Amazon Inspector by Default."
+      FunctionName: Lambda-Enable-Inspector
+      Handler: index.lambda_handler
+      Layers:
+        - !Ref LambdaLayerCfnresponse
+      Role: !GetAtt LambdaRoleEnableInspector.Arn
+      Runtime: python3.9
+      MemorySize: 128
+      Timeout: 600
+      Environment:
+        Variables:
+            AUDIT_ACCOUNT_ID: !Ref InspectorAuditAccountId
+            EXECUTION_ROLE_NAME: !Ref RoleToAssume
+            EXCLUDED_ACCOUNTS: !Ref ExcludedAccounts
+
+  LambdaLayerCfnresponse:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      CompatibleRuntimes:
+        - python3.9
+      Content:
+        S3Bucket: !Ref S3SourceBucket
+        S3Key: !Ref cfnresponse
+      Description: v1.1.2 of cfnresponse
+      LayerName: cfnresponse
+
+  LambdaRoleEnableInspector:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: "Service-Role for Lambda-Enable-Inspector to have the required access to execute successfully"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      RoleName: "LambdaExecutionRole-EnableInspector"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+      - PolicyName: "Enable-Inspector"
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: "Allow"
+            Action:
+              - "sts:AssumeRole"
+            Resource: !Sub "arn:aws:iam::*:role/${RoleToAssume}"
+            Condition:
+              StringEquals:
+                "aws:PrincipalOrgId": !Ref OrganizationId
+          - Effect: "Allow"
+            Action:
+              - organizations:DeregisterDelegatedAdministrator
+            Resource: !Sub "arn:aws:organizations::${AWS::AccountId}:account/${OrganizationId}/*"
+          - Effect: "Allow"
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource:
+              - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+              - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/Lambda-Enable-Inspector:*"             
+      - PolicyName: inspector-org-policy     
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Sid: Inspector2Access
+            Effect: Allow
+            Action:
+              - inspector2:EnableDelegatedAdminAccount
+              - inspector2:UpdateOrganizationConfiguration
+              - inspector2:Disable
+              - inspector2:DescribeOrganizationConfiguration
+              - inspector2:GetMember
+              - inspector2:DisassociateMember
+              - inspector2:BatchGetAccountStatus
+              - inspector2:AssociateMember
+              - inspector2:Enable
+              - inspector2:UpdateConfiguration
+              - cloudformation:ListStackInstances
+              - organizations:RegisterDelegatedAdministrator
+              - organizations:ListAccounts
+              - organizations:ListDelegatedAdministrators
+              - organizations:ListAWSServiceAccessForOrganization
+              - organizations:DescribeOrganization
+              - organizations:DisableAWSServiceAccess
+              - organizations:EnableAWSServiceAccess
+            Resource: '*'
+      - PolicyName: inspector-org-policy-iam
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Sid: AllowReadIamActions
+            Effect: Allow
+            Action: iam:GetRole
+            Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/*
+
+          - Sid: AllowCreateServiceLinkedRole
+            Effect: Allow
+            Action: iam:CreateServiceLinkedRole
+            Condition:
+              StringLike:
+                iam:AWSServiceName: inspector2.amazonaws.com
+            Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/inspector2.amazonaws.com/AWSServiceRoleForAmazonInspector2
+
+          - Sid: AllowPolicyActions
+            Effect: Allow
+            Action: iam:PutRolePolicy
+            Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/inspector2.amazonaws.com/AWSServiceRoleForAmazonInspector2
+
+          - Sid: AllowDeleteServiceLinkRole
+            Effect: Allow
+            Action: iam:DeleteServiceLinkedRole
+            Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/inspector2.amazonaws.com/AWSServiceRoleForAmazonInspector2
+
+  LifeCycleRuleInspector:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Amazon Inspector LifeCycle Trigger"
+      EventPattern:
+        source:
+          - "aws.controltower"
+        detail-type:
+          - "AWS Service Event via CloudTrail"
+        detail:
+          eventName:
+            - "CreateManagedAccount"
+      State: "ENABLED"
+      Targets:
+        - Arn: !GetAtt LambdaEnableInspector.Arn
+          Id: "NewAccount"
+
+  PermissionForCTEventToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt LambdaEnableInspector.Arn
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt LifeCycleRuleInspector.Arn
+
+  CustomResourceEnableInspector:
+    DependsOn:
+      - LambdaRoleEnableInspector
+    Type: Custom::EnableAWSInspector
+    Properties:
+      ServiceToken: !GetAtt LambdaEnableInspector.Arn
